@@ -1,24 +1,71 @@
-We will build a Python library for efficient and scalable image analysis together.
-The draft for the design is explained in DESIGN_DOC.md.
+We are building `bioimage_py`, a Python library for efficient, parallel, and distributed (block-wise)
+image analysis. It is an evolution of [elf](https://github.com/constantinpape/elf) and
+[cluster-tools](https://github.com/constantinpape/cluster_tools). The full design rationale and the
+plan for the next step (the slurm runner) live in DESIGN_DOC.md — read it before making design changes.
+
+Reference clones are available locally at `/home/pape/Work/my_projects/elf` and
+`/home/pape/Work/my_projects/cluster_tools`; mirror their proven patterns. Prefer algorithms from
+[bioimage-cpp](https://github.com/computational-cell-analytics/bioimage-cpp) (`import bioimage_cpp`)
+when available; otherwise fall back to numpy / scipy / scikit-image.
 
 # Library Structure
 
-TODO: the library will be in the folder bioimage_py.
-It will create a sub-package `runner` to implement the runner logic and dedicated sub-packages for other
-functionality, such as `stats` (e.g. to impleent max, min, mean, std, etc.), `segmentation`, `wrapper` (for on-the-fly transformations of the input data), etc.
+The package lives in `bioimage_py/`:
 
-# Installation 
+- `runner/` — execution backends. `base.py` (the `Runner` ABC + the backend-independent `run()` +
+  `LocalRunner` + the shared `run_block`), `distributed.py` (`_DistributedRunner` base,
+  `SubprocessRunner`, and the `SlurmRunner` stub), `_harness.py` (worker entry point), `config.py`
+  (`RunnerConfig` / `SlurmConfig`), `factory.py` (`get_runner`).
+- `sources/` — `Source` ABC + `SourceSpec` (`base.py`), `ArraySource` for numpy/zarr/z5py
+  (`array_source.py`), and the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`).
+- `wrapper/` — on-the-fly transformation sources (`WrapperSource`, `ThresholdSource`).
+- `stats/`, `filters/`, `segmentation/` — the operations (`stats.max/min/mean/std`,
+  `filters.apply_filter` + the gaussian family, `segmentation.label`).
+- `util.py` — shared helpers: `to_roi`, `get_blocking`, `derive_block_shape`, `sigma_to_halo`, and the
+  `BlockDescriptor` / `ComputeFn` type aliases.
 
-TODO: create pyproject and setup.cfg for this.
+Conventions (follow these):
+
+- Every `__init__.py` is import-only; implementations live in dedicated modules and are re-exported.
+- Blocking comes from `bioimage_cpp.utils` (`Blocking` / `Block` / `BlockWithHalo`); do not reimplement it.
+- A `Source` is indexed only with a tuple of slices. Per-block functions convert a block with
+  `to_roi(block)` (or `to_roi(block.outer_block / .inner_block / .inner_block_local)` under a halo);
+  `Source` does not accept block objects.
+- Per-block functions have the fixed signature `function(block, inputs, outputs, mask)` (the `ComputeFn`
+  alias). They are cloudpickled, so capture only picklable values — dispatch heavy callables (e.g.
+  `bioimage_cpp` functions) by name, not by object.
+- Array-output ops (`filters.*`, `segmentation.label`) take an optional `output`: for local execution a
+  numpy array is allocated and returned when omitted; for distributed execution `output` is required and
+  the runner validates it is file-backed (reopenable). These ops return the output array object.
+- numpy arrays are local-only (their `to_spec()` raises); distributed backends need zarr/n5 sources.
+
+# Installation
+
+Editable install: `python -m pip install -e .` (or `.[test,dev]`). Build/runtime metadata is in
+`pyproject.toml`; `setup.cfg` holds the flake8 config (line length 120). Core deps: `bioimage_cpp`,
+numpy, cloudpickle, tqdm, threadpoolctl (zarr / z5py for file-backed and distributed I/O).
 
 # Tests
 
-TODO: Tests will be written with pytest
+`python -m pytest -q` runs the suite under `tests/`. The headline `tests/test_runner_parity.py` asserts
+`direct == LocalRunner == SubprocessRunner` for the ops — keep this parity green, it is the core
+correctness guarantee. Use the `zarr_factory` / `rng` fixtures in `tests/conftest.py`.
 
 # Coding standards etc.
 
-Code should be PEP8-compliant (line limit 120), use type annotations in the function definitions and
-google-style doc strings. The documentation will later be build with pdoc (so you can already use specific
-conventions from it if needed).
+Code should be PEP8-compliant (line limit 120), use type annotations on every function (parameters and
+return type), and google-style doc strings. The documentation will later be built with pdoc (so you can
+already use specific conventions from it if needed). Public functions document all parameters with
+consistent wording; private helpers get a concise one-line docstring.
 
-Use pyflakes and flake8 for linting.
+Use pyflakes and flake8 for linting: `python -m flake8 bioimage_py tests` and
+`python -m pyflakes bioimage_py`.
+
+# Status and next step
+
+Implemented and tested: the full `local` path, the `subprocess` backend (the real distributed protocol —
+cloudpickle payload, generated harness, per-task result/sentinel files, `block_ids` re-run, failure
+reporting), and the three operations above. `SlurmRunner` is a stub. **Next step: implement the slurm
+runner on the actual cluster** — see "Implementing the slurm runner" in DESIGN_DOC.md. The distributed
+protocol is already factored into `_DistributedRunner`; slurm only needs `_launch_and_wait` (sbatch array
+submission + `sacct` polling) plus a reattach manifest.

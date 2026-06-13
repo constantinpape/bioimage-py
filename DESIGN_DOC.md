@@ -41,8 +41,7 @@ Wrappers (on-the-fly transforms) are `Source`s that wrap another `Source`; see t
 
 ## Runner
 
-The core element is a flexible runner implementation that can dispatch to local execution (a thread-pool) or distributed execution (for now we slurm, may be extended in the future). It is implemented with a `Runner` class hierachy (an abstract base class + implementations for the different runners).
-The runners then dispatch the computation etc.
+The core element is a flexible runner implementation that can dispatch to local execution (a thread pool), to local subprocesses (the `subprocess` backend), or to a distributed scheduler (slurm; more may be added). It is implemented with a `Runner` class hierarchy (an abstract base class + implementations for the different runners). The `subprocess` backend runs the *full* distributed protocol — cloudpickle payload, generated harness, per-task result/sentinel files — but launches tasks locally with no scheduler, so the local/distributed parity can be tested in CI and slurm becomes a thin layer on top (see "Implementing the slurm runner").
 
 ### Calling convention for the per-block function
 
@@ -99,14 +98,14 @@ The per-block function and its (small) bound arguments are serialized with **`cl
 
 For debuggability we write a human-readable artifact next to the payload: a best-effort `inspect.getsource(fn)` dump (and the call metadata) in the job temp folder. Correctness never depends on it; it is only there to make a failed job easy to inspect.
 
-To guard against version skew, the payload is stamped with the Python version and an environment/lib hash, validated by the worker before running so a mismatch fails loudly and early.
+To guard against version skew, the payload is stamped with the Python (major, minor) version, validated by the worker before running so a mismatch fails loudly and early. (Stamping a fuller environment/library hash is a possible later hardening.)
 
 ### Validation in `run()`
 
 Before dispatching, `run()` validates the job and fails early with actionable errors:
 
 - **Shape consistency.** The mask and all inputs must describe the same shape (so a single block indexes them consistently). A mask at a different resolution is brought onto the input grid with an up-/down-sampling wrapper that *reports the wrapped (effective) shape* — so the check is simply "do the reported shapes match"; it does not special-case resolution. Outputs are allowed to differ in shape from the inputs (e.g. a downsampled output), and are blocked on their own grid.
-- **Write safety (to be tackled at implementation time).** When there are `outputs`, `run()` must guarantee concurrency-safe writes. zarr/n5 are safe for concurrent writes to *different* chunks / shards but corrupt on concurrent writes to the *same* chunk / shard. The intended rule is: the output write-blocks (`block.inner_block` under a halo, otherwise the block itself) must align to the output's chunk grid so that each chunk is written by exactly one block. `run()` should validate this (and either adjust the block shape to a multiple of the chunk shape or raise). The exact alignment/derivation logic is best worked out when we implement the first output-writing operation.
+- **Write safety (implemented as a conservative guard).** When there are `outputs`, `run()` must guarantee concurrency-safe writes. zarr/n5 are safe for concurrent writes to *different* chunks / shards but corrupt on concurrent writes to the *same* chunk / shard. The rule: the output write-blocks (`block.inner_block` under a halo, otherwise the block itself) must align to the output's chunk grid so that each chunk is written by exactly one block. `run()` currently validates that, for any chunked output, the block shape is a multiple of the output chunk shape, and raises otherwise. Auto-deriving a safe block shape (instead of raising) remains a future improvement.
 
 ### Optimization: skipping empty blocks (later)
 
@@ -140,7 +139,7 @@ def max(
     input: SourceLike,  # Any source-like object; numpy arrays restrict execution to local.
     num_workers: int = 1,  # Number of parallel workers.
     block_shape: Optional[Tuple[int, ...]] = None,  # Block shape; if None and single worker, compute directly.
-    job_type: str = "local",  # Either 'local' or 'slurm' (may be extended in the future).
+    job_type: str = "local",  # 'local', 'subprocess', or 'slurm'.
     job_config: Optional[RunnerConfig] = None,  # Runner configuration, especially for slurm.
     mask: Optional[SourceLike] = None,  # Optional binary mask; only values within the mask are considered.
     block_ids: Optional[Sequence[int]] = None,  # Restrict to these blocks; relevant for re-running failed jobs.
@@ -233,3 +232,27 @@ class ThresholdSource(Source):
 Because wrappers are `Source`s, they are serialized and reopened on workers exactly like any other source — no parsing or code rebuilding. For local execution the live wrapper object is used directly; for distributed execution it is cloudpickled (or reconstructed from `to_spec()`). Building out a small set of composable, serializable wrappers (threshold, cast, rescale, channel selection, resolution/scale adaptation) is the remaining work here.
 
 The **resolution/scale-adapting wrapper** is what makes a differently-sampled mask usable: it wraps a low- (or high-) resolution source and resamples on read so that `__getitem__(roi)` returns data on the target (input) grid, while *reporting the effective, resampled `shape`*. This is what lets `run()`'s shape-consistency check stay simple — it only compares reported shapes, so a wrapped mask that matches the input shape passes, and an unwrapped mismatched mask is rejected with a clear error rather than silently mis-indexed.
+
+## Implementation status and insights
+
+The first slice is implemented and tested: `stats.max/min/mean/std`, `filters.apply_filter` (+ the gaussian-family convenience functions), and `segmentation.label`, on the `local` and `subprocess` backends; `slurm` is a stub (next section). Key decisions and insights from building it:
+
+- **One per-block code path for all backends.** `runner.run_block(...)` builds the `Block` / `BlockWithHalo` and calls the user function; both `LocalRunner` and the worker harness call it. This is what makes the `direct == local == subprocess` parity tests meaningful — there is no separate distributed code path to drift from.
+- **The `subprocess` backend is the slurm dress rehearsal.** It implements the entire distributed protocol — temp folder, cloudpickle `payload.pkl`, generated per-task work-lists, per-task result + `.success` sentinel files (sentinel written *after* the result, so it never advertises a missing result), result collection, failure reporting with a preserved temp folder + failed `block_ids`, and `block_ids` re-run. All of this lives in a shared `_DistributedRunner` base; `SubprocessRunner` overrides only `_launch_and_wait` (a local `subprocess.Popen` per task, capped at `num_workers`). The worker entry point is `python -m bioimage_py.runner._harness <tmp> <task_id>`.
+- **`output` is optional for local, required for distributed.** Array-output ops (`filters.*`, `segmentation.label`) allocate and return a fresh numpy array when `output` is omitted *and* the backend is local; distributed runs require a file-backed `output`. The runner enforces this up front via `_DistributedRunner._require_reopenable`, which calls `to_spec()` on every input/output/mask and raises a role-tagged, "file-backed (zarr/n5)" error for in-memory arrays. Always allocating a *fresh* array on omission (rather than filtering in place) also removes the halo-in-place hazard.
+- **Connected components: relabel only over labels that exist.** Stage 1 uses the cluster_tools offset scheme (`offset = block_id * prod(block_shape)`), which is *sparse*. Relabeling the whole union-find element space (size `max_label + 1`) yields a correct partition but non-compact ids (max ≫ component count). The fix: stage 1 returns each block's actual labels, and stage 3 relabels the union-find roots of only those labels → compact, consecutive output ids. This is validated with a partition-equality (not id-equality) check against whole-array `bioimage_cpp.segmentation.label`.
+- **Filters dispatch by name, not by function object.** The per-block closure looks up `bioimage_cpp.filters` functions by string in a module-level dict, so the cloudpickled closure captures only picklable values (a string, the sigma, small tuples). Halo per axis is `sigma_to_halo(sigma, order)` (mirrors elf / VIGRA: `2·ceil(3σ + 0.5·order + 0.5)`).
+- **Multi-stage = sequential `run()` calls** sharing the same `block_shape` so block ids line up across stages; the labeled volume itself is the inter-stage state (no task graph needed). A compute function recovers its own block id with `blocking.coordinates_to_block_id(block.begin)`, keeping the `function(block, inputs, outputs, mask)` convention unchanged.
+- **Still deferred:** the resolution-adapting mask wrapper (only equal-shape masks are accepted now), empty-block skipping, write-safety auto-derivation (only a chunk-multiple guard is implemented), and the multichannel / structure-tensor filter paths beyond the scalar gaussian family covered by parity tests.
+
+## Implementing the slurm runner (next step)
+
+The protocol is done; slurm is a thin layer. `SlurmRunner` already subclasses `_DistributedRunner`. To finish it, implement `_launch_and_wait(tmp, n_tasks, num_workers, name)` and drop the `run()` override — everything else (payload, harness, result/sentinel collection, failure handling, `block_ids` re-run, `_require_reopenable`) is inherited and already exercised by the `subprocess` backend. The slurm-specific work and gotchas:
+
+- **Submit one array job.** Render an sbatch script from `SlurmConfig` (partition, time, mem, cpus_per_task, gpus, account, qos, constraint, shebang) with `--array=0-(n_tasks-1)%<throttle>`. Map array index → task id; the per-task command is exactly the harness invocation the subprocess backend already uses. Note `num_workers` for slurm means the array throttle, decoupled from task count — the base already partitions into `n_tasks` independently of `num_workers`.
+- **Shared filesystem.** The temp folder (`RunnerConfig.tmp_root`) must live on a filesystem visible to all compute nodes (not node-local `/tmp`); validate or strongly default this. The harness reopens sources from their specs there and writes results/sentinels there.
+- **Worker environment.** The generated script must activate the same Python environment so `bioimage_py`, `bioimage_cpp` and dependencies import on the node (via `SlurmConfig.shebang` / a module-load or conda-activate preamble; default to the submitting `sys.executable`). The payload's Python `(major, minor)` stamp catches mismatches at run time.
+- **Poll terminal states with `sacct`, not `squeue`.** `squeue` drops finished jobs; `sacct -j <jobid> --format=JobID,State -P` reports terminal states reliably (COMPLETED / FAILED / TIMEOUT / OUT_OF_MEMORY / NODE_FAIL / PREEMPTED / CANCELLED). The ground truth for success stays the per-task `.success` sentinel file; the scheduler is queried only to detect *dead* tasks (gone from the scheduler in a terminal state but with no sentinel → failed). Poll every `config.poll_interval` seconds and update the progress report (pending / running / succeeded / failed counts).
+- **Manifest + reattach.** Write a manifest (submitted array/job id, block→task assignment, temp folder) at submission time so a later call can *reattach* to a still-running array instead of resubmitting. The orchestrating process typically runs on a login node and may be interrupted during multi-hour jobs, so reattach matters more here than for `subprocess`.
+- **Re-run on failure** already works via `block_ids`: the raised `RunnerError` carries `failed_block_ids` and the preserved `tmp_folder`; re-invoking the op (or `runner.run`) with those `block_ids` re-partitions and resubmits only the failed blocks.
+- **Testing without a cluster.** Keep the `subprocess` backend as the CI proxy for the protocol; add slurm-only tests (behind a marker / cluster check) asserting parity against `local`/`subprocess` for the same inputs.
