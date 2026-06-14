@@ -9,12 +9,15 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent import futures
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cloudpickle
 from bioimage_cpp.utils import Blocking
@@ -23,6 +26,7 @@ from tqdm import tqdm
 from ..sources.base import Source
 from ..util import ComputeFn
 from .base import Runner, RunnerError
+from .config import RunnerConfig, SlurmConfig
 
 
 def _partition(block_ids: Sequence[int], n_tasks: int) -> List[List[int]]:
@@ -121,7 +125,39 @@ class _DistributedRunner(Runner):
                 json.dump([int(b) for b in ids], f)
 
         self._launch_and_wait(tmp, n_tasks, num_workers, name)
+        return self._finalize(tmp, n_tasks, tasks, block_ids, has_return_val, name)
 
+    def _finalize(
+        self,
+        tmp: str,
+        n_tasks: int,
+        tasks: Sequence[Sequence[int]],
+        block_ids: Sequence[int],
+        has_return_val: bool,
+        name: str,
+    ) -> List[Any]:
+        """Check the per-task sentinels, then collect results or raise on failure.
+
+        Shared by :meth:`_execute` and :meth:`SlurmRunner.reattach` so a detached run is
+        finalized identically to an in-process one.
+
+        Args:
+            tmp: The job temp folder.
+            n_tasks: The number of tasks the run was partitioned into.
+            tasks: The per-task block-id lists (``tasks[task_id]``), used to map a failed
+                task back to its block ids.
+            block_ids: The full ordered block-id list (used to order collected results).
+            has_return_val: Whether per-block return values were collected.
+            name: A short name for the failure message.
+
+        Returns:
+            The per-block return values in ``block_ids`` order if ``has_return_val``, else
+            a list of ``None`` of the same length.
+
+        Raises:
+            RunnerError: If any task is missing its success sentinel; the preserved temp
+                folder and the failed block ids are attached.
+        """
         # Ground truth for success is the per-task sentinel file, not the launcher's status.
         failed_tasks = [t for t in range(n_tasks)
                         if not os.path.exists(os.path.join(tmp, "success", f"{t}.success"))]
@@ -151,7 +187,8 @@ class _DistributedRunner(Runner):
         err_path = os.path.join(tmp, "error", f"{failed_tasks[0]}.txt")
         if os.path.exists(err_path):
             with open(err_path) as f:
-                first = f.read().strip().splitlines()[-1] if f else None
+                lines = f.read().strip().splitlines()
+            first = lines[-1] if lines else None
         return (
             f"{len(failed_tasks)} task(s) failed in '{name or 'run'}'. "
             f"Temp folder preserved for debugging: {tmp}. First error: {first!r}"
@@ -183,17 +220,350 @@ class SubprocessRunner(_DistributedRunner):
                       desc=name or None, disable=not name))
 
 
-class SlurmRunner(_DistributedRunner):
-    """Stub for the slurm backend. To be implemented next session on the cluster."""
+# Scheduler states from which a task will not progress further. The ground truth for
+# success is still the per-task sentinel file; these are used only to detect *dead* tasks
+# (terminal in the scheduler but with no sentinel -> failed).
+_TERMINAL_STATES = frozenset({
+    "COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
+    "PREEMPTED", "CANCELLED", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT",
+})
+# Fallback array-size cap if the cluster's MaxArraySize cannot be queried.
+_DEFAULT_MAX_ARRAY = 1001
 
-    def run(self, *args, **kwargs):  # type: ignore[override]
-        """Not implemented yet; the slurm backend lands next session."""
-        raise NotImplementedError("The slurm backend is not implemented yet (next session).")
+
+class SlurmRunner(_DistributedRunner):
+    """Distributed runner that submits one sbatch array job and polls it with ``sacct``.
+
+    Reuses the full distributed protocol from :class:`_DistributedRunner` (cloudpickle
+    payload, generated work-lists, per-task result + ``.success`` sentinel files, failure
+    reporting and ``block_ids`` re-run) and overrides only how tasks are launched and
+    awaited. The per-task sentinel file remains the ground truth for success; ``sacct`` is
+    queried only to detect tasks that died without writing a sentinel. A manifest is written
+    at submission time so an interrupted run can be picked back up with :meth:`reattach`.
+    """
+
+    def __init__(self, config: Optional[RunnerConfig] = None):
+        """Create the runner, requiring a :class:`SlurmConfig`.
+
+        Args:
+            config: The slurm configuration. ``None`` uses an all-default ``SlurmConfig``
+                (which still requires ``tmp_root`` to be set before running).
+
+        Raises:
+            TypeError: If ``config`` is a non-slurm ``RunnerConfig``.
+        """
+        if config is None:
+            config = SlurmConfig()
+        if not isinstance(config, SlurmConfig):
+            raise TypeError(
+                f"SlurmRunner requires a SlurmConfig, got {type(config).__name__}. "
+                "Pass job_config=SlurmConfig(...) (it carries partition/account/time/etc.)."
+            )
+        super().__init__(config)
 
     def _launch_and_wait(self, tmp: str, n_tasks: int, num_workers: int, name: str) -> None:
-        # Next session: render an sbatch array script (one task per array index) using
-        # SlurmConfig, submit with `sbatch`, poll terminal states with `sacct` (not squeue),
-        # treat the per-task sentinel files as ground truth, and write a manifest enabling
-        # reattach if the orchestrating process dies. The harness and result/sentinel
-        # protocol are reused unchanged from the base class.
-        raise NotImplementedError("The slurm backend is not implemented yet (next session).")
+        """Submit an sbatch array job for the tasks and poll until they all finish.
+
+        Args:
+            tmp: The job temp folder (must live on a shared filesystem).
+            n_tasks: The number of tasks (array indices ``0 .. n_tasks - 1``).
+            num_workers: The array throttle (max tasks running concurrently).
+            name: A short name used for the job name and progress display.
+        """
+        if self.config.tmp_root is None:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(
+                "SlurmRunner requires config.tmp_root to be set to a shared filesystem "
+                "visible to all compute nodes (node-local /tmp is not usable)."
+            )
+
+        max_array = (self.config.max_array_size if self.config.max_array_size is not None
+                     else self._max_array_size())
+        if n_tasks > max_array:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(
+                f"Run partitioned into {n_tasks} tasks exceeds the maximum array size "
+                f"{max_array}. Lower num_workers or use a larger block_shape."
+            )
+
+        os.makedirs(os.path.join(tmp, "logs"), exist_ok=True)
+        throttle = max(1, min(int(num_workers), n_tasks))
+        script_path = os.path.join(tmp, "submit.sh")
+        with open(script_path, "w") as f:
+            f.write(self._build_script(tmp, n_tasks, throttle, name))
+
+        job_id = self._submit(script_path)
+        with open(os.path.join(tmp, "manifest.json"), "w") as f:
+            json.dump({
+                "job_id": job_id,
+                "n_tasks": n_tasks,
+                "throttle": throttle,
+                "name": name,
+                "tmp": tmp,
+                "script": script_path,
+                "python_executable": self.config.python_executable or sys.executable,
+                "submit_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, f, indent=2)
+
+        self._poll(job_id, n_tasks, tmp, name)
+
+    def _build_script(self, tmp: str, n_tasks: int, throttle: int, name: str) -> str:
+        """Render the sbatch array script for the run."""
+        cfg = self.config
+        shebang, preamble = "#!/bin/bash", ""
+        if cfg.shebang:
+            lines = cfg.shebang.splitlines()
+            if lines and lines[0].startswith("#!"):
+                shebang, preamble = lines[0], "\n".join(lines[1:])
+            else:
+                preamble = cfg.shebang
+
+        # Collapse whitespace/newlines so the name cannot break or inject directives.
+        job_name = "_".join((name or "").split()) or "bioimage_py"
+        directives = [
+            f"--job-name={job_name}",
+            f"--array=0-{n_tasks - 1}%{throttle}",
+            f"--cpus-per-task={int(cfg.cpus_per_task)}",
+            f"--output={os.path.join(tmp, 'logs', 'slurm-%A_%a.out')}",
+            f"--error={os.path.join(tmp, 'logs', 'slurm-%A_%a.err')}",
+        ]
+        if cfg.partition is not None:
+            directives.append(f"--partition={cfg.partition}")
+        if cfg.time is not None:
+            directives.append(f"--time={cfg.time}")
+        if cfg.mem is not None:
+            directives.append(f"--mem={cfg.mem}")
+        if int(cfg.gpus) > 0:
+            directives.append(f"--gpus={int(cfg.gpus)}")
+        if cfg.account is not None:
+            directives.append(f"--account={cfg.account}")
+        if cfg.qos is not None:
+            directives.append(f"--qos={cfg.qos}")
+        if cfg.constraint is not None:
+            directives.append(f"--constraint={cfg.constraint}")
+
+        python = shlex.quote(cfg.python_executable or sys.executable)
+        command = f'{python} -m bioimage_py.runner._harness {shlex.quote(tmp)} "${{SLURM_ARRAY_TASK_ID}}"'
+        lines = [shebang]
+        lines += [f"#SBATCH {d}" for d in directives]
+        if preamble:
+            lines.append(preamble)
+        lines.append(command)
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _submit(script_path: str) -> str:
+        """Submit ``script_path`` with ``sbatch --parsable`` and return the job id."""
+        sbatch = shutil.which("sbatch")
+        if sbatch is None:
+            raise RuntimeError("sbatch not found on PATH; the slurm CLI must be available.")
+        proc = subprocess.run([sbatch, "--parsable", script_path],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"sbatch submission failed (exit {proc.returncode}): "
+                               f"{proc.stderr.strip() or proc.stdout.strip()}")
+        job_id = proc.stdout.strip().split(";")[0].strip()
+        if not job_id.isdigit():
+            raise RuntimeError(f"Could not parse job id from sbatch output: {proc.stdout!r}")
+        return job_id
+
+    @staticmethod
+    def _max_array_size() -> int:
+        """Return the cluster's ``MaxArraySize`` (or a safe fallback)."""
+        scontrol = shutil.which("scontrol")
+        if scontrol is None:
+            return _DEFAULT_MAX_ARRAY
+        try:
+            proc = subprocess.run([scontrol, "show", "config"], capture_output=True, text=True)
+        except OSError:
+            return _DEFAULT_MAX_ARRAY
+        match = re.search(r"MaxArraySize\s*=\s*(\d+)", proc.stdout)
+        return int(match.group(1)) if match else _DEFAULT_MAX_ARRAY
+
+    @staticmethod
+    def _parse_array_range(spec: str) -> List[int]:
+        """Expand a pending-collapse range like ``[2-9,11%4]`` into its task indices."""
+        body = spec.strip("[]").split("%", 1)[0]
+        indices: List[int] = []
+        for part in body.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                indices.extend(range(int(lo), int(hi) + 1))
+            else:
+                indices.append(int(part))
+        return indices
+
+    def _sacct_states(self, job_id: str) -> Optional[Dict[int, str]]:
+        """Return ``{array_index: STATE}`` for the array job, or ``None`` on a poll error.
+
+        ``None`` (a transient ``sacct`` failure) means *skip this poll*; an empty dict means
+        the job is simply not registered with the scheduler yet. A task absent from the
+        result is treated as pending, never as dead.
+        """
+        sacct = shutil.which("sacct")
+        if sacct is None:
+            raise RuntimeError("sacct not found on PATH; the slurm CLI must be available.")
+        try:
+            proc = subprocess.run(
+                [sacct, "-X", "-n", "-P", "--format=JobID,State", "-j", str(job_id)],
+                capture_output=True, text=True,
+            )
+        except OSError:
+            return None
+        if proc.returncode != 0:
+            return None
+
+        states: Dict[int, str] = {}
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            jid, _, raw_state = line.partition("|")
+            jid = jid.split(";", 1)[0]
+            if "." in jid or "_" not in jid:  # step rows (defensive; -X already excludes them)
+                continue
+            # Take the first token: normalises e.g. "CANCELLED by 12345" -> "CANCELLED".
+            tokens = raw_state.split()
+            state = tokens[0].upper() if tokens else ""
+            suffix = jid.split("_", 1)[1]
+            if suffix.startswith("["):
+                for idx in self._parse_array_range(suffix):
+                    states[idx] = state
+            else:
+                try:
+                    states[int(suffix)] = state
+                except ValueError:
+                    continue
+        return states
+
+    def _job_known(self, job_id: str, attempts: int = 3) -> bool:
+        """Whether the job is known to ``sacct``, retrying to tolerate post-submit lag.
+
+        A transient ``sacct`` error (``None``) or any returned row counts as known; only a
+        sustained empty result across ``attempts`` polls is treated as unknown.
+        """
+        for attempt in range(attempts):
+            states = self._sacct_states(job_id)
+            if states is None or states:
+                return True
+            if attempt + 1 < attempts:
+                time.sleep(self.config.poll_interval)
+        return False
+
+    def _poll(self, job_id: str, n_tasks: int, tmp: str, name: str) -> None:
+        """Poll ``sacct`` until every task has a visible sentinel or is confirmed dead.
+
+        The scheduler ``State`` is not subject to NFS lag, but the ``.success`` sentinels the
+        compute nodes write can take up to the mount's attribute-cache timeout to become
+        visible here. So a ``COMPLETED`` task (its harness exited 0, hence wrote a sentinel)
+        is given ``config.latency_wait`` for that sentinel to appear; any other terminal
+        state means the harness did not succeed and the task is declared dead after a short
+        confirmation grace. Tasks absent from ``sacct`` are pending, never dead.
+
+        Args:
+            job_id: The submitted array job id.
+            n_tasks: The number of tasks to await.
+            tmp: The job temp folder (where sentinels are written).
+            name: A short name for the progress bar (disables it when empty).
+        """
+        def has_sentinel(t: int) -> bool:
+            return os.path.exists(os.path.join(tmp, "success", f"{t}.success"))
+
+        latency_wait = max(float(self.config.latency_wait), self.config.poll_interval)
+        fail_grace = max(self.config.poll_interval, 5.0)
+        terminal_since: Dict[int, float] = {}
+        terminal_count: Dict[int, int] = {}
+        resolved: set = set()
+        with tqdm(total=n_tasks, desc=name or None, disable=not name) as pbar:
+            while len(resolved) < n_tasks:
+                states = self._sacct_states(job_id)
+                if states is None:  # transient sacct error: skip this poll.
+                    time.sleep(self.config.poll_interval)
+                    continue
+
+                now = time.monotonic()
+                ok = {t for t in range(n_tasks) if has_sentinel(t)}
+                running = sum(1 for s in states.values() if s == "RUNNING")
+                dead = set()
+                for t in range(n_tasks):
+                    if t in ok:
+                        terminal_since.pop(t, None)
+                        terminal_count.pop(t, None)
+                        continue
+                    state = states.get(t)
+                    if state in _TERMINAL_STATES:
+                        terminal_since.setdefault(t, now)
+                        terminal_count[t] = terminal_count.get(t, 0) + 1
+                        # COMPLETED -> sentinel was written, just wait it out over NFS; any
+                        # other terminal state -> the task will never produce a sentinel.
+                        grace = latency_wait if state == "COMPLETED" else fail_grace
+                        if (terminal_count[t] >= 2 and now - terminal_since[t] >= grace
+                                and not has_sentinel(t)):
+                            dead.add(t)
+                    else:  # pending/running/requeued: reset the dead countdown.
+                        terminal_since.pop(t, None)
+                        terminal_count.pop(t, None)
+
+                resolved = ok | dead
+                pbar.n = len(resolved)
+                pbar.set_postfix(ok=len(ok), failed=len(dead), run=running,
+                                 pending=max(0, n_tasks - len(resolved) - running), refresh=False)
+                pbar.refresh()
+                if len(resolved) >= n_tasks:
+                    break
+                try:
+                    time.sleep(self.config.poll_interval)
+                except KeyboardInterrupt:
+                    print(f"\nInterrupted while waiting on slurm job {job_id}. The job was left "
+                          f"running; reattach with SlurmRunner(...).reattach({tmp!r}).")
+                    raise
+
+    def reattach(self, tmp_folder: str, name: str = "reattach") -> Optional[list]:
+        """Reattach to a previously submitted run and finalize it.
+
+        Picks a run back up from its manifest (e.g. after the orchestrating login-node
+        process was interrupted) instead of resubmitting. Only ``poll_interval`` is read
+        from this runner's config, so a freshly constructed ``SlurmRunner`` can reattach.
+
+        Args:
+            tmp_folder: The job temp folder containing ``manifest.json`` and ``payload.pkl``.
+            name: A short name for the progress display.
+
+        Returns:
+            The per-block return values (if the run collected any), else ``None``.
+
+        Raises:
+            RunnerError: If any task failed (sentinel missing).
+            RuntimeError: If the manifest's job is unknown to slurm and the run did not
+                already complete.
+        """
+        with open(os.path.join(tmp_folder, "manifest.json")) as f:
+            manifest = json.load(f)
+        job_id, n_tasks = str(manifest["job_id"]), int(manifest["n_tasks"])
+        with open(os.path.join(tmp_folder, "payload.pkl"), "rb") as f:
+            has_return_val = bool(cloudpickle.load(f)["has_return_val"])
+
+        # Reconstruct the partition in numeric task order (never glob: it sorts lexically).
+        tasks: List[List[int]] = []
+        for task_id in range(n_tasks):
+            with open(os.path.join(tmp_folder, "blocks", f"{task_id}.json")) as f:
+                tasks.append(json.load(f))
+        block_ids = [b for task in tasks for b in task]
+
+        all_done = all(os.path.exists(os.path.join(tmp_folder, "success", f"{t}.success"))
+                       for t in range(n_tasks))
+        if not all_done:
+            # Only a job that stays unknown to sacct across retries (not registration lag
+            # right after submit, nor a transient error) is treated as unrecoverable.
+            if not self._job_known(job_id):
+                raise RuntimeError(
+                    f"Slurm job {job_id} is not known to the scheduler and the run did not "
+                    f"complete. Inspect {tmp_folder} or resubmit."
+                )
+            self._poll(job_id, n_tasks, tmp_folder, name)
+
+        results = self._finalize(tmp_folder, n_tasks, tasks, block_ids, has_return_val, name)
+        return results if has_return_val else None

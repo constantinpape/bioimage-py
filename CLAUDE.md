@@ -1,7 +1,7 @@
 We are building `bioimage_py`, a Python library for efficient, parallel, and distributed (block-wise)
 image analysis. It is an evolution of [elf](https://github.com/constantinpape/elf) and
-[cluster-tools](https://github.com/constantinpape/cluster_tools). The full design rationale and the
-plan for the next step (the slurm runner) live in DESIGN_DOC.md — read it before making design changes.
+[cluster-tools](https://github.com/constantinpape/cluster_tools). The full design rationale lives in
+DESIGN_DOC.md — read it before making design changes.
 
 Reference clones are available locally at `/home/pape/Work/my_projects/elf` and
 `/home/pape/Work/my_projects/cluster_tools`; mirror their proven patterns. Prefer algorithms from
@@ -13,9 +13,10 @@ when available; otherwise fall back to numpy / scipy / scikit-image.
 The package lives in `bioimage_py/`:
 
 - `runner/` — execution backends. `base.py` (the `Runner` ABC + the backend-independent `run()` +
-  `LocalRunner` + the shared `run_block`), `distributed.py` (`_DistributedRunner` base,
-  `SubprocessRunner`, and the `SlurmRunner` stub), `_harness.py` (worker entry point), `config.py`
-  (`RunnerConfig` / `SlurmConfig`), `factory.py` (`get_runner`).
+  `LocalRunner` + the shared `run_block`), `distributed.py` (`_DistributedRunner` base + the shared
+  `_finalize`, `SubprocessRunner`, and `SlurmRunner` — sbatch array submission, `sacct` polling and
+  reattach), `_harness.py` (worker entry point), `config.py` (`RunnerConfig` / `SlurmConfig`),
+  `factory.py` (`get_runner`).
 - `sources/` — `Source` ABC + `SourceSpec` (`base.py`), `ArraySource` for numpy/zarr/z5py
   (`array_source.py`), and the `as_source` / `from_spec` / `SourceLike` dispatch (`dispatch.py`).
 - `wrapper/` — on-the-fly transformation sources (`WrapperSource`, `ThresholdSource`).
@@ -61,11 +62,14 @@ consistent wording; private helpers get a concise one-line docstring.
 Use pyflakes and flake8 for linting: `python -m flake8 bioimage_py tests` and
 `python -m pyflakes bioimage_py`.
 
-# Status and next step
+# Status
 
 Implemented and tested: the full `local` path, the `subprocess` backend (the real distributed protocol —
 cloudpickle payload, generated harness, per-task result/sentinel files, `block_ids` re-run, failure
-reporting), and the three operations above. `SlurmRunner` is a stub. **Next step: implement the slurm
-runner on the actual cluster** — see "Implementing the slurm runner" in DESIGN_DOC.md. The distributed
-protocol is already factored into `_DistributedRunner`; slurm only needs `_launch_and_wait` (sbatch array
-submission + `sacct` polling) plus a reattach manifest.
+reporting), the `slurm` backend (sbatch array submission, `sacct` polling, reattach via a manifest), and
+the three operations above. The slurm-only tests in `tests/test_slurm_runner.py` are skipped unless
+`sbatch` is on `PATH` and `BIOIMAGE_PY_SHARED_TMP` points at a shared filesystem; `subprocess` stays the
+CI proxy for the shared protocol. Note the slurm runner's key subtlety: per-task `.success` sentinels are
+written on compute nodes but can take up to the NFS attribute-cache timeout (~60 s) to become visible to
+the orchestrating node, so success is detected via the sentinel while the lag-free `sacct` `State`
+distinguishes a `COMPLETED`-but-not-yet-visible task (wait `latency_wait`) from a genuinely dead one.

@@ -1,1 +1,10 @@
 __pycache__/
+*.egg-info/
+.pytest_cache/
+.eggs/
+build/
+dist/
+
+# Local scratch for slurm smoke tests / BIOIMAGE_PY_SHARED_TMP runs
+.slurm_smoke/
+.slurm_test_tmp/
