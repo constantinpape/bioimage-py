@@ -8,7 +8,7 @@ the ``local`` / ``subprocess`` / ``slurm`` backends. No custom C++ (nifty) code 
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -172,6 +172,7 @@ def morphology(
     job_config: Optional[RunnerConfig] = None,
     mask: Optional[SourceLike] = None,
     block_ids: Optional[Sequence[int]] = None,
+    pre_cleanup: Optional[Callable[[str], None]] = None,
 ) -> "pd.DataFrame":
     """Compute per-label morphology (size, center of mass, bounding box) of a labeled volume.
 
@@ -189,6 +190,11 @@ def morphology(
         mask: Optional binary mask; voxels outside the mask are excluded from the computation.
         block_ids: Restrict processing to these block ids (e.g. to re-run previously failed blocks);
             the table then reflects only those blocks.
+        pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback invoked on the orchestrating
+            process with the job temp folder right before it is deleted (distributed backends only).
+            Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
+            Ignored for the ``local`` backend and for the direct (single-worker, unchunked) path, which
+            have no temp folder.
 
     Returns:
         A pandas DataFrame with one row per label, sorted by label, with columns ``label``, ``size``,
@@ -209,7 +215,7 @@ def morphology(
         runner = get_runner(job_type, job_config)
         results = runner.run(_morphology_block, [input], num_workers=num_workers,
                              block_shape=block_shape, mask=mask, block_ids=block_ids,
-                             has_return_val=True, name="morphology")
+                             has_return_val=True, name="morphology", pre_cleanup=pre_cleanup)
         tables = [r for r in results if r is not None]
 
     return _to_dataframe(*_merge_tables(tables, ndim), ndim)

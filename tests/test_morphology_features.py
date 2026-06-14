@@ -132,6 +132,44 @@ def test_regionprops_empty():
     assert {"label", "n_voxels", "area", "surface_area"} <= set(df.columns)
 
 
+def test_pre_cleanup_forwarded_subprocess(zarr_factory, rng, tmp_path):
+    """morphology()/regionprops() forward pre_cleanup so per-worker timings can be persisted.
+
+    The callback fires on the orchestrating process with the job temp folder right before it is
+    deleted; the distributed harness has already written one ``timings/<task_id>.json`` per task.
+    """
+    import glob
+    import json
+    import os
+
+    from bioimage_py.runner.config import RunnerConfig
+
+    seg = _blobs((24, 32, 36), rng)
+    z = zarr_factory(seg, chunks=(12, 16, 18))
+    captured = {}
+
+    def save(name):
+        def _cb(tmp_folder):
+            recs = [json.load(open(p))
+                    for p in glob.glob(os.path.join(tmp_folder, "timings", "*.json"))]
+            captured[name] = recs
+        return _cb
+
+    cfg = RunnerConfig(tmp_root=str(tmp_path))
+    table = bp.morphology.morphology(z, num_workers=2, block_shape=(12, 16, 18),
+                                     job_type="subprocess", job_config=cfg,
+                                     pre_cleanup=save("morphology"))
+    df = bp.morphology.regionprops(z, table, resolution=(2.0, 1.0, 1.0), num_workers=2,
+                                   job_type="subprocess", job_config=cfg,
+                                   pre_cleanup=save("regionprops"))
+
+    assert set(captured) == {"morphology", "regionprops"}
+    for name, recs in captured.items():
+        assert recs, f"{name}: no per-task timing records found"
+        assert all("compute_s" in r for r in recs), f"{name}: timing record missing compute_s"
+    assert len(df) == len(table) > 0  # the workflow still produced the expected objects
+
+
 def test_regionprops_requires_integer():
     with pytest.raises(ValueError, match="integer"):
         bp.morphology.regionprops(np.zeros((5, 6, 7), dtype="float32"), pd.DataFrame({"label": [1]}))

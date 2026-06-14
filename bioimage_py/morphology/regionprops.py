@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 import bioimage_cpp as bic
 import numpy as np
@@ -232,6 +232,7 @@ def regionprops(
     num_workers: int = 1,
     job_type: str = "local",
     job_config: Optional[RunnerConfig] = None,
+    pre_cleanup: Optional[Callable[[str], None]] = None,
 ) -> "pd.DataFrame":
     """Compute per-object morphology features for a labeled volume, one task per object.
 
@@ -257,6 +258,10 @@ def regionprops(
         num_workers: Number of parallel workers (threads for ``local``, tasks for distributed backends).
         job_type: Execution backend: one of ``"local"``, ``"subprocess"`` or ``"slurm"``.
         job_config: Backend configuration (a `RunnerConfig` / `SlurmConfig`).
+        pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback invoked on the orchestrating
+            process with the job temp folder right before it is deleted (distributed backends only).
+            Use it to read out the per-task timing files under ``tmp_folder/timings/`` before cleanup.
+            Ignored for the ``local`` backend (no temp folder).
 
     Returns:
         A pandas DataFrame with one row per object, sorted by ``label``: ``label``, ``n_voxels`` (raw
@@ -322,7 +327,8 @@ def regionprops(
         }
         runner = get_runner(job_type, job_config)
         results = runner.map(functools.partial(_object_features, ctx=ctx), n,
-                             num_workers=num_workers, has_return_val=True, name="regionprops")
+                             num_workers=num_workers, has_return_val=True, name="regionprops",
+                             pre_cleanup=pre_cleanup)
     finally:
         if tmp_table is not None and os.path.exists(tmp_table):
             os.remove(tmp_table)
