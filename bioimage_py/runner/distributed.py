@@ -89,15 +89,10 @@ class _DistributedRunner(Runner):
         pre_cleanup: Optional[Callable[[str], None]] = None,
     ) -> List[Any]:
         # Validate up front that every source can be reopened on a worker (file-backed).
+        # to_spec() raises here for numpy inputs, the actionable "numpy is local-only" failure.
         self._require_reopenable(inputs, outputs, mask)
-        tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
-        for sub in ("blocks", "results", "success", "error", "timings"):
-            os.makedirs(os.path.join(tmp, sub), exist_ok=True)
-
-        # Build and write the cloudpickle payload. to_spec() raises here for numpy inputs,
-        # which is the actionable "numpy is local-only" failure for distributed backends.
-        payload = {
-            "function": function,
+        payload_extra = {
+            "mode": "block",
             "input_specs": [s.to_spec() for s in inputs],
             "output_specs": [s.to_spec() for s in outputs],
             "mask_spec": mask.to_spec() if mask is not None else None,
@@ -105,8 +100,62 @@ class _DistributedRunner(Runner):
             "block_shape": tuple(block_shape),
             "roi": roi,
             "halo": None if halo is None else [int(h) for h in halo],
+        }
+        return self._run_ids(function, block_ids, payload_extra, has_return_val,
+                             num_workers, name, pre_cleanup)
+
+    def _execute_map(
+        self,
+        *,
+        function: Callable[[int], Any],
+        item_ids: Sequence[int],
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> List[Any]:
+        """Ship ``function(index)`` over ``item_ids`` (no sources/blocking; closure-carried data)."""
+        return self._run_ids(function, item_ids, {"mode": "map"}, has_return_val,
+                             num_workers, name, pre_cleanup)
+
+    def _run_ids(
+        self,
+        function: Callable[..., Any],
+        ids: Sequence[int],
+        payload_extra: Dict[str, Any],
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]],
+    ) -> List[Any]:
+        """Shared protocol: write the payload + per-task id lists, launch, and finalize.
+
+        Used by both the block-wise :meth:`_execute` (``payload_extra`` carries the source specs
+        and blocking) and :meth:`_execute_map` (``payload_extra = {"mode": "map"}``). The
+        per-task work-list directory is still ``blocks/`` regardless of mode.
+
+        Args:
+            function: The cloudpickled per-block / per-item callable.
+            ids: The block ids or item indices to process.
+            payload_extra: Mode-specific payload keys (must include ``"mode"``).
+            has_return_val: Whether the callable returns a value to collect.
+            num_workers: Number of parallel tasks.
+            name: A short name for progress display.
+            pre_cleanup: Optional pre-cleanup callback forwarded to :meth:`_finalize`.
+
+        Returns:
+            The per-id return values in ``ids`` order if ``has_return_val``, else ``None``s.
+        """
+        ids = [int(b) for b in ids]
+        tmp = tempfile.mkdtemp(prefix="bioimage_py_", dir=self.config.tmp_root)
+        for sub in ("blocks", "results", "success", "error", "timings"):
+            os.makedirs(os.path.join(tmp, sub), exist_ok=True)
+
+        payload = {
+            "function": function,
             "has_return_val": bool(has_return_val),
             "python": tuple(sys.version_info[:2]),
+            **payload_extra,
         }
         with open(os.path.join(tmp, "payload.pkl"), "wb") as f:
             cloudpickle.dump(payload, f)
@@ -119,14 +168,14 @@ class _DistributedRunner(Runner):
         with open(os.path.join(tmp, "source.py"), "w") as f:
             f.write(source)
 
-        n_tasks = max(1, min(int(num_workers), len(block_ids)))
-        tasks = _partition(block_ids, n_tasks)
-        for task_id, ids in enumerate(tasks):
+        n_tasks = max(1, min(int(num_workers), len(ids))) if ids else 1
+        tasks = _partition(ids, n_tasks)
+        for task_id, task_ids in enumerate(tasks):
             with open(os.path.join(tmp, "blocks", f"{task_id}.json"), "w") as f:
-                json.dump([int(b) for b in ids], f)
+                json.dump([int(b) for b in task_ids], f)
 
         self._launch_and_wait(tmp, n_tasks, num_workers, name)
-        return self._finalize(tmp, n_tasks, tasks, block_ids, has_return_val, name,
+        return self._finalize(tmp, n_tasks, tasks, ids, has_return_val, name,
                               pre_cleanup=pre_cleanup)
 
     def _finalize(

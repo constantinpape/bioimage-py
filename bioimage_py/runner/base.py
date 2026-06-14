@@ -139,6 +139,57 @@ class Runner(ABC):
         )
         return results if has_return_val else None
 
+    def map(
+        self,
+        function: Callable[[int], Any],
+        n_items: Optional[int] = None,
+        *,
+        item_ids: Optional[Sequence[int]] = None,
+        num_workers: int = 1,
+        has_return_val: bool = True,
+        name: str = "",
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> Optional[list]:
+        """Map ``function(index)`` over item indices in parallel, across any backend.
+
+        Unlike :meth:`run`, this is not block-wise: there is no domain, blocking, sources or
+        mask. ``function`` takes a single integer index and returns its result; it must carry
+        whatever data it needs in its (cloudpickled) closure — e.g. a `SourceSpec` it reopens
+        and a file path it reads. This is the per-item counterpart used by per-object
+        workflows.
+
+        Args:
+            function: The per-item function ``function(index) -> result``.
+            n_items: The number of items; indices ``0 .. n_items - 1`` are processed. Ignored
+                if ``item_ids`` is given.
+            item_ids: Explicit item indices to process (e.g. to re-run failures). Defaults to
+                ``range(n_items)``.
+            num_workers: Number of parallel workers / tasks.
+            has_return_val: Whether ``function`` returns a value to collect.
+            name: A short name for progress display.
+            pre_cleanup: Optional ``pre_cleanup(tmp_folder)`` callback (distributed backends
+                only); see :meth:`run`.
+
+        Returns:
+            The list of per-item return values (in ``item_ids`` order) if ``has_return_val``,
+            else ``None``.
+
+        Raises:
+            ValueError: If neither ``n_items`` nor ``item_ids`` is given.
+        """
+        if item_ids is None:
+            if n_items is None:
+                raise ValueError("map() requires either n_items or item_ids.")
+            item_ids = list(range(int(n_items)))
+        else:
+            item_ids = [int(i) for i in item_ids]
+
+        results = self._execute_map(
+            function=function, item_ids=item_ids, has_return_val=has_return_val,
+            num_workers=num_workers, name=name, pre_cleanup=pre_cleanup,
+        )
+        return results if has_return_val else None
+
     @staticmethod
     def _validate_write_safety(outputs: Sequence[Source], block_shape: Sequence[int]) -> None:
         """Conservative guard: chunked output write-blocks must be a multiple of chunks.
@@ -180,6 +231,20 @@ class Runner(ABC):
         """Execute the per-block function over ``block_ids`` and return ordered results."""
         ...
 
+    @abstractmethod
+    def _execute_map(
+        self,
+        *,
+        function: Callable[[int], Any],
+        item_ids: Sequence[int],
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> List[Any]:
+        """Execute ``function(index)`` over ``item_ids`` and return ordered results."""
+        ...
+
 
 class LocalRunner(Runner):
     """Run blocks locally with a thread pool."""
@@ -207,31 +272,67 @@ class LocalRunner(Runner):
         ``pre_cleanup`` is accepted for interface parity but ignored: the local runner has
         no temp folder (and no per-worker concept) to read out before returning.
         """
-        results: list = [None] * len(block_ids)
+        def call_one(bid: int) -> Any:
+            return run_block(function, blocking, bid, inputs, outputs, mask, halo)
+
+        return self._run_pool(block_ids, call_one, num_workers, name, unit="block")
+
+    def _execute_map(
+        self,
+        *,
+        function: Callable[[int], Any],
+        item_ids: Sequence[int],
+        has_return_val: bool,
+        num_workers: int,
+        name: str,
+        pre_cleanup: Optional[Callable[[str], None]] = None,
+    ) -> List[Any]:
+        """Run ``function(index)`` over ``item_ids`` in a thread pool (``pre_cleanup`` ignored)."""
+        return self._run_pool(item_ids, lambda i: function(int(i)), num_workers, name, unit="item")
+
+    @staticmethod
+    def _run_pool(ids: Sequence[int], call_one: Callable[[int], Any], num_workers: int,
+                  name: str, *, unit: str = "block") -> List[Any]:
+        """Run ``call_one(id)`` for each id in a thread pool, ordered, re-raising failures.
+
+        Args:
+            ids: The work ids (block ids or item indices).
+            call_one: The per-id callable returning that id's result.
+            num_workers: Number of worker threads.
+            name: A short name for the progress bar (disabled when empty).
+            unit: The noun used in the failure message ("block" or "item").
+
+        Returns:
+            The per-id results in ``ids`` order.
+
+        Raises:
+            RunnerError: If any id fails; the failed ids are attached for re-running.
+        """
+        ids = list(ids)
+        results: list = [None] * len(ids)
         failed: List[int] = []
         first_error: Optional[BaseException] = None
 
         @threadpool_limits.wrap(limits=1)
         def _run(idx: int):
-            bid = block_ids[idx]
-            return idx, run_block(function, blocking, bid, inputs, outputs, mask, halo)
+            return idx, call_one(ids[idx])
 
         with futures.ThreadPoolExecutor(max(1, int(num_workers))) as tp:
-            fut_to_idx = {tp.submit(_run, idx): idx for idx in range(len(block_ids))}
-            for fut in tqdm(futures.as_completed(fut_to_idx), total=len(block_ids),
+            fut_to_idx = {tp.submit(_run, idx): idx for idx in range(len(ids))}
+            for fut in tqdm(futures.as_completed(fut_to_idx), total=len(ids),
                             desc=name or None, disable=not name):
                 idx = fut_to_idx[fut]
                 try:
                     i, res = fut.result()
                     results[i] = res
                 except Exception as error:  # noqa: BLE001 - we re-raise as RunnerError
-                    failed.append(block_ids[idx])
+                    failed.append(ids[idx])
                     if first_error is None:
                         first_error = error
 
         if failed:
             raise RunnerError(
-                f"{len(failed)} block(s) failed in '{name or 'run'}': "
+                f"{len(failed)} {unit}(s) failed in '{name or 'run'}': "
                 f"{sorted(failed)[:10]}. First error: {first_error!r}",
                 failed_block_ids=sorted(failed),
             )

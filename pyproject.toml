@@ -12,6 +12,8 @@ license = { file = "LICENSE" }
 authors = [{ name = "Constantin Pape", email = "constantin.pape@cs.uni-goettingen.de" }]
 dependencies = [
     "numpy",
+    "pandas",
+    "scikit-image>=0.20",
     "cloudpickle",
     "tqdm",
     "threadpoolctl",
@@ -20,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 io = ["zarr>=3", "z5py"]
-test = ["pytest", "zarr>=3", "scikit-image", "scipy"]
+test = ["pytest", "zarr>=3", "scikit-image", "scipy", "openpyxl"]
 dev = ["flake8", "pyflakes"]
 
 [tool.setuptools.packages.find]

@@ -1,5 +1,6 @@
 """Headline parity tests: direct == local(1) == local(N) == subprocess(N)."""
 import numpy as np
+import pandas as pd
 import pytest
 
 import bioimage_cpp as bic
@@ -40,3 +41,33 @@ def test_gaussian_parity(zarr_factory, rng):
                                       num_workers=nw, job_type=job)
         np.testing.assert_allclose(out[:], ref, atol=1e-4,
                                    err_msg=f"mismatch for nw={nw} job={job}")
+
+
+def test_morphology_parity(zarr_factory, rng):
+    from skimage.measure import label as sklabel  # local import: test-only dependency.
+
+    # A labeled volume whose objects straddle block boundaries, so the cross-block merge is exercised.
+    seg = sklabel(rng.random((37, 41, 23)) > 0.55).astype("uint64")
+    z = zarr_factory(seg, chunks=(16, 16, 16))
+    expected = bp.morphology.morphology(seg)  # direct
+
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = bp.morphology.morphology(z, num_workers=nw, block_shape=(16, 16, 16), job_type=job)
+        pd.testing.assert_frame_equal(expected, out, obj=f"morphology nw={nw} job={job}")
+
+
+def test_regionprops_parity(zarr_factory):
+    # A handful of objects (so the per-object map partitions into several tasks) straddling chunks.
+    seg = np.zeros((24, 32, 28), dtype="uint64")
+    seg[2:9, 3:14, 4:12] = 1
+    seg[12:20, 18:30, 15:26] = 2
+    seg[3:7, 20:28, 2:10] = 3
+    seg[15:22, 4:12, 18:26] = 4
+    z = zarr_factory(seg, chunks=(16, 16, 16))
+    table = bp.morphology.morphology(seg)
+    res = (2.0, 1.0, 1.5)
+
+    expected = bp.morphology.regionprops(seg, table, resolution=res)  # direct (local, 1 worker)
+    for nw, job in [(1, "local"), (4, "local"), (3, "subprocess")]:
+        out = bp.morphology.regionprops(z, table, resolution=res, num_workers=nw, job_type=job)
+        pd.testing.assert_frame_equal(expected, out, obj=f"regionprops nw={nw} job={job}")

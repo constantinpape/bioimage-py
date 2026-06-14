@@ -38,13 +38,24 @@ def _run_task(tmp: str, task_id: int) -> None:
     with open(os.path.join(tmp, "blocks", f"{task_id}.json")) as f:
         block_ids = json.load(f)
 
-    inputs = [from_spec(s) for s in payload["input_specs"]]
-    outputs = [from_spec(s) for s in payload["output_specs"]]
-    mask = from_spec(payload["mask_spec"]) if payload["mask_spec"] is not None else None
-    blocking = get_blocking(payload["shape"], payload["block_shape"], payload["roi"])
     function = payload["function"]
-    halo = payload["halo"]
     has_return_val = payload["has_return_val"]
+    mode = payload.get("mode", "block")
+
+    # In "map" mode the function carries its own data in its closure (a SourceSpec it
+    # reopens, a file path it reads); the runner reopens no sources and builds no blocking.
+    if mode == "map":
+        def call_one(bid):
+            return function(int(bid))
+    else:
+        inputs = [from_spec(s) for s in payload["input_specs"]]
+        outputs = [from_spec(s) for s in payload["output_specs"]]
+        mask = from_spec(payload["mask_spec"]) if payload["mask_spec"] is not None else None
+        blocking = get_blocking(payload["shape"], payload["block_shape"], payload["roi"])
+        halo = payload["halo"]
+
+        def call_one(bid):
+            return run_block(function, blocking, bid, inputs, outputs, mask, halo)
 
     # Time only the block-processing loop (the parallelizable read+compute+write work),
     # excluding the fixed per-task payload load / source reopen above and any scheduler
@@ -53,7 +64,7 @@ def _run_task(tmp: str, task_id: int) -> None:
     t0 = time.time()
     results = []
     for bid in block_ids:
-        res = run_block(function, blocking, bid, inputs, outputs, mask, halo)
+        res = call_one(bid)
         if has_return_val:
             results.append((int(bid), res))
     compute_s = time.time() - t0
