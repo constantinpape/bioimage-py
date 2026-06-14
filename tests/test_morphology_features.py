@@ -31,7 +31,8 @@ def test_regionprops_matches_skimage_3d(rng):
     seg = _blobs((28, 36, 40), rng)
     res = (2.0, 1.0, 1.5)
     table = bp.morphology.morphology(seg)
-    df = bp.morphology.regionprops(seg, table, resolution=res, num_workers=2).set_index("label")
+    df = bp.morphology.regionprops(seg, table, resolution=res, compute_surface=True,
+                                   num_workers=2).set_index("label")
 
     props = {rp.label: rp for rp in regionprops(seg.astype("int32"), spacing=res)}
     assert set(df.index) == set(props)
@@ -39,13 +40,13 @@ def test_regionprops_matches_skimage_3d(rng):
         row = df.loc[label]
         n = int((seg == label).sum())
         assert int(row["n_voxels"]) == n
+        # The numpy moment features reproduce the scikit-image definitions exactly.
         assert np.isclose(row["area"], rp.area)              # area == physical volume under spacing
         assert np.isclose(row["area"], n * float(np.prod(res)))
-        assert np.isclose(row["axis_major_length"], rp.axis_major_length)
-        assert np.isclose(row["axis_minor_length"], rp.axis_minor_length)
+        # atol covers float noise on degenerate (e.g. one-voxel-thick) objects whose minor axis ~ 0.
+        assert np.isclose(row["axis_major_length"], rp.axis_major_length, atol=1e-6)
+        assert np.isclose(row["axis_minor_length"], rp.axis_minor_length, atol=1e-6)
         assert np.isclose(row["extent"], rp.extent)
-        assert np.isclose(row["solidity"], rp.solidity)
-        assert np.isclose(row["euler_number"], rp.euler_number)
         assert np.isclose(row["equivalent_diameter_area"], rp.equivalent_diameter_area)
         # surface area matches an independent marching-cubes on the same object
         assert np.isclose(row["surface_area"], _direct_surface((seg == label)[rp.slice], res))
@@ -127,7 +128,7 @@ def test_output_path_written(tmp_path, rng):
 def test_regionprops_empty():
     seg = np.zeros((6, 8, 10), dtype="uint64")
     table = bp.morphology.morphology(seg)
-    df = bp.morphology.regionprops(seg, table)
+    df = bp.morphology.regionprops(seg, table, compute_surface=True)
     assert len(df) == 0
     assert {"label", "n_voxels", "area", "surface_area"} <= set(df.columns)
 

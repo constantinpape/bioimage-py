@@ -1,19 +1,25 @@
-"""Advanced per-object morphology: scikit-image regionprops + surface area and centroid correction.
+"""Advanced per-object morphology: numpy moment features + surface area and centroid correction.
 
-A *second pass* on top of :func:`bioimage_py.morphology.morphology`: for each labeled object it crops the
-sub-volume by the precomputed bounding box, masks ``== label``, and computes scikit-image regionprops
-(in physical units via ``spacing``) plus a marching-cubes ``surface_area`` (3D) and a corrected centroid
-(the center-of-mass if it lies inside the object, else the deepest-interior voxel via the Euclidean
-distance transform). The regionprops ``area`` already gives the physical volume under ``spacing``. Work
-is mapped one task per object with the generic
-:meth:`bioimage_py.runner.base.Runner.map`, so it runs identically across ``local`` / ``subprocess`` /
-``slurm``; for distributed backends the base table is serialized to a temp file the workers read.
+A *second pass* on top of :func:`bioimage_py.morphology.morphology`: for each labeled object it crops
+the sub-volume by the precomputed bounding box, masks ``== label``, and computes shape features
+directly with numpy (in physical units via ``resolution``) — the physical volume (``area``), the
+``extent``, the ``equivalent_diameter_area`` and the major/minor ``axis_*_length`` from the object's
+second moments — plus an optional marching-cubes ``surface_area`` (3D) and a corrected centroid (the
+center-of-mass if it lies inside the object, else the deepest-interior voxel via the Euclidean
+distance transform).
+
+The moment features reproduce the corresponding scikit-image ``regionprops`` definitions exactly, but
+without constructing a ``RegionProperties`` object per label (and without the expensive convex-hull
+``solidity`` / topological ``euler_number``), so the pass scales linearly in the number of objects.
+Work is mapped one task per object with the generic
+:meth:`bioimage_py.runner.base.Runner.map`, so it runs identically across ``local`` / ``subprocess``
+/ ``slurm``; for distributed backends the base table is serialized to a temp file the workers read.
 """
 from __future__ import annotations
 
 import functools
+import importlib.util
 import os
-import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 import bioimage_cpp as bic
@@ -29,31 +35,18 @@ if TYPE_CHECKING:
 
 __all__ = ["regionprops"]
 
-# Non-positional shape descriptors: unambiguous under cropping (no local/global frame issue).
-_DEFAULT_PROPERTIES = ("area", "equivalent_diameter_area", "extent", "solidity",
-                       "euler_number", "axis_major_length", "axis_minor_length")
-
-# Per-worker caches so each task reopens the segmentation / reads the table once, not per object.
+# Per-worker cache so each task reopens the segmentation `SourceSpec` once, not per object (keyed by
+# the spec's stable fields). The consumed table columns travel in the closure as numpy arrays, so
+# they need no worker-side caching.
 _SEG_CACHE: Dict[Any, Source] = {}
-_TABLE_CACHE: Dict[str, "pd.DataFrame"] = {}
 
 
-def _check_skimage() -> None:
-    """Ensure scikit-image is importable and new enough to support the ``spacing`` argument."""
-    try:
-        import inspect
-
-        import skimage
-        from skimage.measure import regionprops_table
-    except ImportError as exc:  # pragma: no cover - exercised only without the dependency.
+def _check_surface_deps() -> None:
+    """Ensure scikit-image is importable (only needed when ``compute_surface`` is requested)."""
+    if importlib.util.find_spec("skimage") is None:  # pragma: no cover - needs skimage uninstalled.
         raise ImportError(
-            "bioimage_py.morphology.regionprops requires scikit-image (>= 0.20); "
-            "install it (e.g. pip install 'scikit-image>=0.20')."
-        ) from exc
-    if "spacing" not in inspect.signature(regionprops_table).parameters:
-        raise RuntimeError(
-            "bioimage_py.morphology.regionprops needs scikit-image >= 0.20 for the 'spacing' "
-            f"argument; found {skimage.__version__}."
+            "regionprops(compute_surface=True) requires scikit-image; install it "
+            "(e.g. pip install scikit-image) or pass compute_surface=False."
         )
 
 
@@ -95,15 +88,19 @@ def _resolve_seg(seg: Union[Source, Any]) -> Source:
     return src
 
 
-def _resolve_table(table: Union[str, "pd.DataFrame"]) -> "pd.DataFrame":
-    """Return the table DataFrame, reading (and caching) it if a path was passed."""
-    if isinstance(table, str):
-        df = _TABLE_CACHE.get(table)
-        if df is None:
-            df = _read_table(table)
-            _TABLE_CACHE[table] = df
-        return df
-    return table
+def _column_arrays(df: "pd.DataFrame", axes: Sequence[str]) -> Dict[str, np.ndarray]:
+    """Extract the consumed columns as numpy arrays (built once, indexed by row position).
+
+    Indexing these arrays by position avoids per-object pandas scalar access, which dominates the
+    cost when there are many objects. Returns ``label`` (``(N,)``) and ``com`` / ``bb_min`` /
+    ``bb_max`` (each ``(N, ndim)``).
+    """
+    return {
+        "label": df["label"].to_numpy(dtype="int64"),
+        "com": np.stack([df[f"com_{a}"].to_numpy(dtype="float64") for a in axes], axis=1),
+        "bb_min": np.stack([df[f"bb_min_{a}"].to_numpy(dtype="int64") for a in axes], axis=1),
+        "bb_max": np.stack([df[f"bb_max_{a}"].to_numpy(dtype="int64") for a in axes], axis=1),
+    }
 
 
 def _surface_area(mask: np.ndarray, resolution: Sequence[float]) -> float:
@@ -119,6 +116,29 @@ def _surface_area(mask: np.ndarray, resolution: Sequence[float]) -> float:
     except (RuntimeError, ValueError):
         # Objects too thin/small for a closed surface.
         return 0.0
+
+
+def _axis_lengths(coords: np.ndarray, spacing: np.ndarray, ndim: int) -> "tuple[float, float]":
+    """Major/minor axis lengths (physical) of the inertia-equivalent ellipse/ellipsoid.
+
+    Mirrors scikit-image: the inertia tensor is ``trace(C) * I - C`` for the population covariance
+    ``C`` of the (physical) voxel coordinates; the axis lengths derive from its eigenvalues (sorted
+    descending). Returns ``(0.0, 0.0)`` for an empty object.
+    """
+    n = coords.shape[0]
+    if n == 0:
+        return 0.0, 0.0
+    x = coords.astype("float64") * spacing
+    xc = x - x.mean(axis=0)
+    cov = (xc.T @ xc) / n  # population covariance == central second moments / area.
+    inertia = np.trace(cov) * np.eye(ndim) - cov
+    ev = np.sort(np.clip(np.linalg.eigvalsh(inertia), 0.0, None))[::-1]  # descending.
+    if ndim == 3:
+        major = float(np.sqrt(max(0.0, 10.0 * (ev[0] + ev[1] - ev[2]))))
+        minor = float(np.sqrt(max(0.0, 10.0 * (-ev[0] + ev[1] + ev[2]))))
+        return major, minor
+    # 2D (and the nD fallback): the ellipse axes are 4 * sqrt(extreme eigenvalues).
+    return float(4.0 * np.sqrt(ev[0])), float(4.0 * np.sqrt(ev[-1]))
 
 
 def _corrected_centroid(mask: np.ndarray, com_global_vox: np.ndarray, origin: np.ndarray,
@@ -147,46 +167,37 @@ def _corrected_centroid(mask: np.ndarray, com_global_vox: np.ndarray, origin: np
 
 def _object_features(index: int, ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Compute the feature row for a single object (the per-item function handed to ``runner.map``)."""
-    from skimage.measure import regionprops_table
     seg = _resolve_seg(ctx["seg"])
-    df = _resolve_table(ctx["table"])
     axes, ndim = ctx["axes"], ctx["ndim"]
-    resolution, properties = ctx["resolution"], ctx["properties"]
+    res = np.asarray(ctx["resolution"], dtype="float64")
 
-    row = df.iloc[index]
-    label = int(row["label"])
-    com = np.array([float(row[f"com_{a}"]) for a in axes], dtype="float64")
-    bb_min = np.array([int(row[f"bb_min_{a}"]) for a in axes], dtype="int64")
-    bb_max = np.array([int(row[f"bb_max_{a}"]) for a in axes], dtype="int64")
+    label = int(ctx["label"][index])
+    com = ctx["com"][index]
+    bb_min = ctx["bb_min"][index]
+    bb_max = ctx["bb_max"][index]
 
     crop = np.asarray(seg[tuple(slice(int(lo), int(hi)) for lo, hi in zip(bb_min, bb_max))])
     mask = crop == label
-    n_voxels = int(mask.sum())
+    coords = np.argwhere(mask)  # crop-local voxel coordinates of the object.
+    n_voxels = int(coords.shape[0])
+    area = n_voxels * float(np.prod(res))  # physical volume under spacing (== skimage's 'area').
 
-    result: Dict[str, Any] = {"label": label, "n_voxels": n_voxels}
-
-    # scikit-image regionprops in physical units (spacing). One synthetic region (label 1); the
-    # real label is kept separately. A degenerate object that breaks a property yields NaNs.
-    if n_voxels > 0:
-        try:
-            feats = regionprops_table(mask.astype("uint8"), properties=list(properties),
-                                      spacing=tuple(resolution))
-            for key, vals in feats.items():
-                if key != "label":
-                    result[key] = float(vals[0])
-        except Exception:  # noqa: BLE001 - degenerate object: report NaNs, do not fail the task.
-            for key in properties:
-                if key != "label":
-                    result[key] = float("nan")
-    else:
-        for key in properties:
-            if key != "label":
-                result[key] = float("nan")
+    bbox_voxels = int(np.prod(bb_max - bb_min))
+    major, minor = _axis_lengths(coords, res, ndim)
+    result: Dict[str, Any] = {
+        "label": label,
+        "n_voxels": n_voxels,
+        "area": area,
+        "extent": (n_voxels / bbox_voxels) if bbox_voxels > 0 else float("nan"),
+        "equivalent_diameter_area": ((2 * ndim * area / np.pi) ** (1.0 / ndim)) if area > 0 else 0.0,
+        "axis_major_length": major,
+        "axis_minor_length": minor,
+    }
 
     if ctx["compute_surface"] and ndim == 3:
-        result["surface_area"] = _surface_area(mask, resolution)
+        result["surface_area"] = _surface_area(mask, ctx["resolution"])
 
-    centroid = _corrected_centroid(mask, com, bb_min.astype("float64"), resolution)
+    centroid = _corrected_centroid(mask, com, bb_min.astype("float64"), ctx["resolution"])
     for a, ax in enumerate(axes):
         result[f"centroid_{ax}"] = float(centroid[a])
     for a, ax in enumerate(axes):
@@ -195,16 +206,15 @@ def _object_features(index: int, ctx: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _order_columns(out: "pd.DataFrame", axes: Sequence[str], compute_surface: bool,
-                   ndim: int) -> List[str]:
-    """Stable column order: identity, geometry, surface, then the regionprops-derived columns."""
-    leading = (["label", "n_voxels"] + [f"centroid_{a}" for a in axes]
-               + [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes])
+def _order_columns(axes: Sequence[str], compute_surface: bool, ndim: int) -> List[str]:
+    """The fixed output column order: identity, shape features, geometry, then surface."""
+    cols = ["label", "n_voxels", "area", "extent", "equivalent_diameter_area",
+            "axis_major_length", "axis_minor_length"]
+    cols += [f"centroid_{a}" for a in axes]
+    cols += [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes]
     if compute_surface and ndim == 3:
-        leading.append("surface_area")
-    leading = [c for c in leading if c in out.columns]
-    rest = [c for c in out.columns if c not in leading]
-    return leading + rest
+        cols.append("surface_area")
+    return cols
 
 
 def _write_table(out: "pd.DataFrame", output_path: str) -> None:
@@ -226,8 +236,7 @@ def regionprops(
     table: Union[str, "pd.DataFrame"],
     *,
     resolution: Optional[Sequence[float]] = None,
-    properties: Optional[Sequence[str]] = None,
-    compute_surface: bool = True,
+    compute_surface: bool = False,
     output_path: Optional[str] = None,
     num_workers: int = 1,
     job_type: str = "local",
@@ -237,11 +246,13 @@ def regionprops(
     """Compute per-object morphology features for a labeled volume, one task per object.
 
     For each object listed in ``table`` (the output of :func:`morphology`), the sub-volume is cropped by
-    its bounding box, masked to the label, and described with scikit-image regionprops (in physical units
-    via ``spacing=resolution``; the ``area`` property is therefore the physical volume) plus a
-    marching-cubes ``surface_area`` (3D only) and a corrected centroid (the center-of-mass when it lies
-    inside the object, otherwise the deepest-interior voxel — the argmax of the Euclidean distance
-    transform).
+    its bounding box, masked to the label, and described with numpy in physical units (via
+    ``resolution``): the physical volume ``area``, the ``extent`` (filled fraction of the bounding box),
+    the ``equivalent_diameter_area`` (diameter of the ball with the same volume) and the major/minor
+    ``axis_*_length`` (from the object's second moments). These reproduce the corresponding
+    scikit-image ``regionprops`` definitions exactly. Optionally a marching-cubes ``surface_area`` (3D
+    only) and a corrected centroid (the center-of-mass when it lies inside the object, otherwise the
+    deepest-interior voxel — the argmax of the Euclidean distance transform) are added.
 
     Args:
         input: The labeled segmentation (a numpy/zarr/n5 array or a `Source`); integer-typed. For the
@@ -251,9 +262,8 @@ def regionprops(
             is the exclusive slice stop, as produced by :func:`morphology`).
         resolution: Per-axis physical voxel size in array (e.g. z, y, x) order. Defaults to ones (voxel
             units).
-        properties: scikit-image regionprops property names. Defaults to a curated non-positional set;
-            adding positional properties (e.g. ``centroid``/``bbox``) yields crop-local values.
-        compute_surface: Whether to add ``surface_area`` (3D inputs only).
+        compute_surface: Whether to add a marching-cubes ``surface_area`` (3D inputs only). This is the
+            most expensive per-object step, so it is off by default.
         output_path: Optional ``.csv`` / ``.xlsx`` path to also write the result to.
         num_workers: Number of parallel workers (threads for ``local``, tasks for distributed backends).
         job_type: Execution backend: one of ``"local"``, ``"subprocess"`` or ``"slurm"``.
@@ -265,18 +275,20 @@ def regionprops(
 
     Returns:
         A pandas DataFrame with one row per object, sorted by ``label``: ``label``, ``n_voxels`` (raw
-        voxel count), ``centroid_<axis>`` (corrected, physical), ``bb_min_<axis>``/``bb_max_<axis>``
-        (global voxels), ``surface_area`` (3D), and the requested regionprops columns (with the default
-        ``properties``, ``area`` is the physical volume).
+        voxel count), ``area`` (physical volume), ``extent``, ``equivalent_diameter_area``,
+        ``axis_major_length``, ``axis_minor_length``, ``centroid_<axis>`` (corrected, physical),
+        ``bb_min_<axis>``/``bb_max_<axis>`` (global voxels), and ``surface_area`` (only when
+        ``compute_surface`` and the input is 3D).
     """
     import pandas as pd
 
-    _check_skimage()
     src = as_source(input)
     if not np.issubdtype(np.dtype(src.dtype), np.integer):
         raise ValueError(f"regionprops expects an integer label image, got dtype {src.dtype}.")
     ndim = src.ndim
     axes = _axis_names(ndim)
+    if compute_surface and ndim == 3:
+        _check_surface_deps()
 
     if resolution is None:
         resolution = tuple(1.0 for _ in range(ndim))
@@ -284,7 +296,6 @@ def regionprops(
         resolution = tuple(float(r) for r in resolution)
         if len(resolution) != ndim:
             raise ValueError(f"resolution {resolution} does not match the input ndim {ndim}.")
-    properties = list(_DEFAULT_PROPERTIES if properties is None else properties)
 
     df = _load_table(table)
     missing = [c for c in _required_columns(axes) if c not in df.columns]
@@ -296,45 +307,31 @@ def regionprops(
 
     n = len(df)
     if n == 0:
-        empty = ["label", "n_voxels"] + [f"centroid_{a}" for a in axes] \
-            + [f"bb_min_{a}" for a in axes] + [f"bb_max_{a}" for a in axes] \
-            + (["surface_area"] if (compute_surface and ndim == 3) else []) \
-            + [p for p in properties if p != "label"]
-        return pd.DataFrame({c: pd.Series(dtype="float64") for c in empty})
+        cols = _order_columns(axes, compute_surface, ndim)
+        return pd.DataFrame({c: pd.Series(dtype="float64") for c in cols})
 
     seg_arg: Any = src
-    table_arg: Any = df
-    tmp_table: Optional[str] = None
-    try:
-        if job_type != "local":
-            try:
-                seg_arg = src.to_spec()
-            except ValueError as err:
-                raise ValueError(
-                    f"Distributed regionprops requires a file-backed (zarr/n5) segmentation. {err}"
-                ) from err
-            # Serialize the (column-subset) table to a temp file the workers read (shared FS for slurm).
-            tmp_root = job_config.tmp_root if job_config is not None else None
-            fd, tmp_table = tempfile.mkstemp(prefix="bioimage_py_morph_", suffix=".csv", dir=tmp_root)
-            os.close(fd)
-            df[_required_columns(axes)].to_csv(tmp_table, index=False)
-            table_arg = tmp_table
+    if job_type != "local":
+        try:
+            seg_arg = src.to_spec()
+        except ValueError as err:
+            raise ValueError(
+                f"Distributed regionprops requires a file-backed (zarr/n5) segmentation. {err}"
+            ) from err
 
-        ctx = {
-            "seg": seg_arg, "table": table_arg, "resolution": resolution,
-            "properties": tuple(properties), "axes": tuple(axes), "ndim": ndim,
-            "compute_surface": bool(compute_surface),
-        }
-        runner = get_runner(job_type, job_config)
-        results = runner.map(functools.partial(_object_features, ctx=ctx), n,
-                             num_workers=num_workers, has_return_val=True, name="regionprops",
-                             pre_cleanup=pre_cleanup)
-    finally:
-        if tmp_table is not None and os.path.exists(tmp_table):
-            os.remove(tmp_table)
+    # The consumed columns travel with the closure as numpy arrays (built once): for distributed
+    # backends they are cloudpickled into the single shared payload the workers read.
+    ctx = {
+        "seg": seg_arg, "resolution": resolution, "axes": tuple(axes), "ndim": ndim,
+        "compute_surface": bool(compute_surface), **_column_arrays(df, axes),
+    }
+    runner = get_runner(job_type, job_config)
+    results = runner.map(functools.partial(_object_features, ctx=ctx), n,
+                         num_workers=num_workers, has_return_val=True, name="regionprops",
+                         pre_cleanup=pre_cleanup)
 
     out = pd.DataFrame(results)
-    out = out[_order_columns(out, axes, compute_surface, ndim)].sort_values("label")
+    out = out[_order_columns(axes, compute_surface, ndim)].sort_values("label")
     out = out.reset_index(drop=True)
     if output_path is not None:
         _write_table(out, output_path)
